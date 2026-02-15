@@ -9,8 +9,16 @@ const PORT = process.env.PORT || 4000;
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
-app.use(cors({ origin: true }));
+app.use(cors({
+  origin: (origin, cb) => cb(null, true),
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
 app.use(express.json());
+
+app.get('/', (_, res) => res.json({ ok: true, message: 'Shop API', docs: '/api/health' }));
+app.get('/api', (_, res) => res.json({ ok: true, message: 'Shop API', health: '/api/health' }));
 
 app.get('/api/health', (_, res) => res.json({ ok: true }));
 
