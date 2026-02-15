@@ -325,6 +325,95 @@ app.post('/api/admin/products', upload.single('image'), async (req, res) => {
   }
 });
 
+app.get('/api/admin/products', async (_, res) => {
+  try {
+    const { data: products, error: prodErr } = await supabase
+      .from('products')
+      .select('id, name_he, description_he, price, image_url, subcategory_id, sort_order')
+      .order('sort_order', { ascending: true });
+    if (prodErr) throw prodErr;
+    const { data: subcategories, error: subErr } = await supabase
+      .from('subcategories')
+      .select('id, name_he, category_id');
+    if (subErr) throw subErr;
+    const { data: categories, error: catErr } = await supabase
+      .from('categories')
+      .select('id, name_he');
+    if (catErr) throw catErr;
+    const subMap = (subcategories || []).reduce((acc, s) => { acc[s.id] = s; return acc; }, {});
+    const catMap = (categories || []).reduce((acc, c) => { acc[c.id] = c; return acc; }, {});
+    const list = (products || []).map((p) => {
+      const sub = subMap[p.subcategory_id];
+      const cat = sub ? catMap[sub.category_id] : null;
+      return {
+        ...p,
+        subcategory_name: sub?.name_he,
+        category_name: cat?.name_he,
+        category_id: sub?.category_id,
+      };
+    });
+    res.json(list);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/admin/products/:id', upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const name_he = (req.body.name_he || '').trim();
+    const description_he = req.body.description_he !== undefined ? (req.body.description_he || '').trim() || null : undefined;
+    const price = req.body.price !== undefined ? Number(req.body.price) : undefined;
+    const subcategory_id = req.body.subcategory_id || undefined;
+
+    const updates = {};
+    if (name_he !== undefined && name_he !== '') updates.name_he = name_he;
+    if (description_he !== undefined) updates.description_he = description_he;
+    if (price !== undefined && !Number.isNaN(price) && price >= 0) updates.price = price.toFixed(2);
+    if (subcategory_id !== undefined) updates.subcategory_id = subcategory_id;
+
+    const file = req.file;
+    if (file && file.buffer) {
+      await ensureProductImagesBucket();
+      const ext = (file.originalname && file.originalname.split('.').pop()) || 'jpg';
+      const safeExt = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext.toLowerCase()) ? ext.toLowerCase() : 'jpg';
+      const path = `products/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`;
+      const { error: uploadErr } = await supabase.storage
+        .from(PRODUCT_IMAGES_BUCKET)
+        .upload(path, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: false });
+      if (uploadErr) throw uploadErr;
+      const { data: urlData } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(path);
+      updates.image_url = urlData?.publicUrl || null;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'אין שדות לעדכון' });
+    }
+
+    const { data: product, error } = await supabase
+      .from('products')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(product);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בעדכון מוצר' });
+  }
+});
+
+app.delete('/api/admin/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase.from('products').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה במחיקת מוצר' });
+  }
+});
+
 if (!process.env.VERCEL) {
   app.listen(PORT, async () => {
     await ensureProductImagesBucket();
