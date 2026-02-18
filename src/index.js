@@ -115,7 +115,33 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+app.get('/api/carousel', async (_, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('home_carousel')
+      .select('id, image_url, sort_order')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const EXPRESS_NOT_DELIVERED_LIMIT = 5;
+
+async function uploadAdminImage(file, folder) {
+  await ensureProductImagesBucket();
+  const ext = (file.originalname && file.originalname.split('.').pop()) || 'jpg';
+  const safeExt = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext.toLowerCase()) ? ext.toLowerCase() : 'jpg';
+  const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`;
+  const { error } = await supabase.storage
+    .from(PRODUCT_IMAGES_BUCKET)
+    .upload(path, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: false });
+  if (error) throw error;
+  const { data } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(path);
+  return data?.publicUrl || null;
+}
 
 const MAX_ORDERS_PER_DELIVERY_SLOT = 5;
 
@@ -411,6 +437,190 @@ app.delete('/api/admin/products/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'שגיאה במחיקת מוצר' });
+  }
+});
+
+app.get('/api/admin/carousel', async (_, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('home_carousel')
+      .select('id, image_url, sort_order, created_at')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/carousel', upload.single('image'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file || !file.buffer) {
+      return res.status(400).json({ error: 'נא להעלות קובץ תמונה' });
+    }
+    await ensureProductImagesBucket();
+    const ext = (file.originalname && file.originalname.split('.').pop()) || 'jpg';
+    const safeExt = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext.toLowerCase()) ? ext.toLowerCase() : 'jpg';
+    const path = `carousel/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`;
+    const { error: uploadErr } = await supabase.storage
+      .from(PRODUCT_IMAGES_BUCKET)
+      .upload(path, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: false });
+    if (uploadErr) throw uploadErr;
+    const { data: urlData } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(path);
+    const image_url = urlData?.publicUrl || null;
+    const { data: existing } = await supabase.from('home_carousel').select('sort_order').order('sort_order', { ascending: false }).limit(1).single();
+    const sort_order = (existing?.sort_order ?? -1) + 1;
+    const { data: row, error } = await supabase
+      .from('home_carousel')
+      .insert({ image_url, sort_order })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בהוספת תמונה לקרוסלה' });
+  }
+});
+
+app.delete('/api/admin/carousel/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase.from('home_carousel').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה במחיקת תמונה מהקרוסלה' });
+  }
+});
+
+app.get('/api/admin/categories', async (_, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('*')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/categories', upload.single('image'), async (req, res) => {
+  try {
+    const name_he = (req.body.name_he || '').trim();
+    const slug = (req.body.slug || '').trim() || `cat-${Date.now()}`;
+    const sort_order = Number(req.body.sort_order);
+    const icon = (req.body.icon || '').trim() || null;
+    if (!name_he) return res.status(400).json({ error: 'חסר שם קטגוריה' });
+    let image_url = null;
+    if (req.file?.buffer) image_url = await uploadAdminImage(req.file, 'categories');
+    const { data, error } = await supabase
+      .from('categories')
+      .insert({ name_he, slug, sort_order: Number.isNaN(sort_order) ? 0 : sort_order, icon, image_url })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בהוספת קטגוריה' });
+  }
+});
+
+app.patch('/api/admin/categories/:id', upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = {};
+    const name_he = (req.body.name_he || '').trim();
+    if (name_he) updates.name_he = name_he;
+    if (req.body.slug !== undefined) updates.slug = (req.body.slug || '').trim() || null;
+    if (req.body.sort_order !== undefined) updates.sort_order = Number(req.body.sort_order) || 0;
+    if (req.body.icon !== undefined) updates.icon = (req.body.icon || '').trim() || null;
+    if (req.file?.buffer) updates.image_url = await uploadAdminImage(req.file, 'categories');
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'אין שדות לעדכון' });
+    const { data, error } = await supabase.from('categories').update(updates).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בעדכון קטגוריה' });
+  }
+});
+
+app.delete('/api/admin/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: subs } = await supabase.from('subcategories').select('id').eq('category_id', id).limit(1);
+    if (subs?.length) return res.status(400).json({ error: 'לא ניתן למחוק קטגוריה שיש בה תת־קטגוריות. מחק קודם את התת־קטגוריות.' });
+    const { error } = await supabase.from('categories').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה במחיקת קטגוריה' });
+  }
+});
+
+app.get('/api/admin/subcategories', async (req, res) => {
+  try {
+    let q = supabase.from('subcategories').select('*').order('sort_order', { ascending: true });
+    if (req.query.category_id) q = q.eq('category_id', req.query.category_id);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/subcategories', upload.single('image'), async (req, res) => {
+  try {
+    const category_id = req.body.category_id;
+    const name_he = (req.body.name_he || '').trim();
+    const slug = (req.body.slug || '').trim() || `sub-${Date.now()}`;
+    const sort_order = Number(req.body.sort_order);
+    if (!category_id || !name_he) return res.status(400).json({ error: 'חסרים קטגוריה או שם תת־קטגוריה' });
+    let image_url = null;
+    if (req.file?.buffer) image_url = await uploadAdminImage(req.file, 'subcategories');
+    const { data, error } = await supabase
+      .from('subcategories')
+      .insert({ category_id, name_he, slug, sort_order: Number.isNaN(sort_order) ? 0 : sort_order, image_url })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בהוספת תת־קטגוריה' });
+  }
+});
+
+app.patch('/api/admin/subcategories/:id', upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = {};
+    if ((req.body.name_he || '').trim()) updates.name_he = req.body.name_he.trim();
+    if (req.body.category_id !== undefined) updates.category_id = req.body.category_id;
+    if (req.body.slug !== undefined) updates.slug = (req.body.slug || '').trim() || null;
+    if (req.body.sort_order !== undefined) updates.sort_order = Number(req.body.sort_order) || 0;
+    if (req.file?.buffer) updates.image_url = await uploadAdminImage(req.file, 'subcategories');
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'אין שדות לעדכון' });
+    const { data, error } = await supabase.from('subcategories').update(updates).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בעדכון תת־קטגוריה' });
+  }
+});
+
+app.delete('/api/admin/subcategories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: prods } = await supabase.from('products').select('id').eq('subcategory_id', id).limit(1);
+    if (prods?.length) return res.status(400).json({ error: 'לא ניתן למחוק תת־קטגוריה שיש בה מוצרים. העבר או מחק קודם את המוצרים.' });
+    const { error } = await supabase.from('subcategories').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה במחיקת תת־קטגוריה' });
   }
 });
 
