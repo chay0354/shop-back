@@ -71,10 +71,11 @@ app.get('/api/store', async (_, res) => {
       .order('sort_order', { ascending: true });
     if (subErr) throw subErr;
 
-    const { data: products } = await supabase
+    const { data: productsRaw } = await supabase
       .from('products')
       .select('*')
       .order('sort_order', { ascending: true });
+    const products = (productsRaw || []).filter((p) => !p.hidden);
 
     const byCategory = (subcategories || []).reduce((acc, sub) => {
       if (!acc[sub.category_id]) acc[sub.category_id] = [];
@@ -109,7 +110,8 @@ app.get('/api/products', async (req, res) => {
     if (subcategoryId) q = q.eq('subcategory_id', subcategoryId);
     const { data, error } = await q;
     if (error) throw error;
-    res.json(data || []);
+    const list = (data || []).filter((p) => !p.hidden);
+    res.json(list);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -207,7 +209,11 @@ app.post('/api/orders', async (req, res) => {
         return res.status(400).json({ error: 'שעת המשלוח שנבחרה מלאה (5 הזמנות). בחרו שעה אחרת.' });
       }
     }
-    const total = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
+    const subtotal = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
+    const FREE_SHIPPING_MIN = 279;
+    const DELIVERY_FEE = 30;
+    const deliveryFee = subtotal > 0 && subtotal < FREE_SHIPPING_MIN ? DELIVERY_FEE : 0;
+    const total = subtotal + deliveryFee;
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({
@@ -312,6 +318,7 @@ app.post('/api/admin/products', upload.single('image'), async (req, res) => {
     const description_he = (req.body.description_he || '').trim() || null;
     const price = Number(req.body.price);
     const sort_order = Number(req.body.sort_order) || 0;
+    const hidden = req.body.hidden === 'true' || req.body.hidden === true;
 
     if (!subcategory_id || !name_he || Number.isNaN(price) || price < 0) {
       return res.status(400).json({ error: 'חסרים שדות חובה: תת־קטגוריה, שם מוצר, מחיר' });
@@ -341,6 +348,7 @@ app.post('/api/admin/products', upload.single('image'), async (req, res) => {
         price: price.toFixed(2),
         image_url,
         sort_order,
+        hidden,
       })
       .select()
       .single();
@@ -355,7 +363,7 @@ app.get('/api/admin/products', async (_, res) => {
   try {
     const { data: products, error: prodErr } = await supabase
       .from('products')
-      .select('id, name_he, description_he, price, image_url, subcategory_id, sort_order')
+      .select('id, name_he, description_he, price, image_url, subcategory_id, sort_order, hidden')
       .order('sort_order', { ascending: true });
     if (prodErr) throw prodErr;
     const { data: subcategories, error: subErr } = await supabase
@@ -391,12 +399,14 @@ app.patch('/api/admin/products/:id', upload.single('image'), async (req, res) =>
     const description_he = req.body.description_he !== undefined ? (req.body.description_he || '').trim() || null : undefined;
     const price = req.body.price !== undefined ? Number(req.body.price) : undefined;
     const subcategory_id = req.body.subcategory_id || undefined;
+    const hidden = req.body.hidden !== undefined ? (req.body.hidden === 'true' || req.body.hidden === true) : undefined;
 
     const updates = {};
     if (name_he !== undefined && name_he !== '') updates.name_he = name_he;
     if (description_he !== undefined) updates.description_he = description_he;
     if (price !== undefined && !Number.isNaN(price) && price >= 0) updates.price = price.toFixed(2);
     if (subcategory_id !== undefined) updates.subcategory_id = subcategory_id;
+    if (hidden !== undefined) updates.hidden = hidden;
 
     const file = req.file;
     if (file && file.buffer) {
