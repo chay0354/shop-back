@@ -1,11 +1,35 @@
 import 'dotenv/config';
+import https from 'https';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { supabase } from './supabase.js';
 
+if (process.env.NODE_ENV !== 'production') {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  console.warn('[server] NODE_TLS_REJECT_UNAUTHORIZED=0 (dev only, for CardCom)');
+}
+
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+function log(level, tag, ...args) {
+  const ts = new Date().toISOString();
+  const prefix = `[${ts}] [${tag}]`;
+  if (level === 'error') console.error(prefix, ...args);
+  else if (level === 'warn') console.warn(prefix, ...args);
+  else console.log(prefix, ...args);
+}
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.path === '/api/health') return;
+    log('info', 'request', req.method, req.path, res.statusCode, `${duration}ms`);
+  });
+  next();
+});
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
@@ -147,8 +171,157 @@ async function uploadAdminImage(file, folder) {
 
 const MAX_ORDERS_PER_DELIVERY_SLOT = 5;
 
-app.get('/api/checkout/delivery-slot-counts', async (_, res) => {
+const CARDCOM_TERMINAL = process.env.CARDCOM_TERMINAL_NUMBER || '';
+const CARDCOM_API_NAME = process.env.CARDCOM_API_NAME || '';
+const CARDCOM_URL = (process.env.CARDCOM_URL || 'https://secure.cardcom.solutions').replace(/\/$/, '');
+
+app.post('/api/checkout/init-payment', async (req, res) => {
   try {
+    const amount = Number(req.body.amount);
+    log('info', 'init-payment', 'request', {
+      amount,
+      productName: req.body.productName,
+      itemsCount: req.body.items?.length,
+      deliveryFee: req.body.deliveryFee,
+      redirectBaseUrl: req.body.redirectBaseUrl || '(from origin)',
+      origin: req.headers.origin,
+    });
+    if (!CARDCOM_TERMINAL || !CARDCOM_API_NAME) {
+      log('warn', 'init-payment', 'missing env', { hasTerminal: !!CARDCOM_TERMINAL, hasApiName: !!CARDCOM_API_NAME });
+      return res.status(503).json({ error: 'תשלום בכרטיס לא מוגדר. הגדר CARDCOM_TERMINAL_NUMBER ו־CARDCOM_API_NAME.' });
+    }
+    if (Number.isNaN(amount) || amount <= 0) {
+      log('warn', 'init-payment', 'invalid amount', amount);
+      return res.status(400).json({ error: 'סכום לא תקין' });
+    }
+    const productName = (req.body.productName || 'הזמנה').substring(0, 100);
+    const baseUrl = req.body.redirectBaseUrl || req.headers.origin || req.get('referer')?.replace(/\/[^/]*$/, '') || 'https://secure.cardcom.solutions';
+    const successRedirectUrl = req.body.successRedirectUrl || `${baseUrl}/checkout`;
+    const failedRedirectUrl = req.body.failedRedirectUrl || `${baseUrl}/checkout`;
+    const deliveryFee = Math.round((Number(req.body.deliveryFee) || 0) * 100) / 100;
+    const round2 = (n) => Math.round(Number(n) * 100) / 100;
+    const productLines = (req.body.items || []).map((item, idx) => {
+      const qty = Number(item.quantity) || 1;
+      const unit = round2(item.unit_price || 0);
+      const lineTotal = round2(qty * unit);
+      return {
+        ProductID: String(idx + 1),
+        Description: (item.product_name_he || item.name_he || 'פריט').substring(0, 200),
+        Quantity: qty,
+        UnitCost: unit,
+        TotalLineCost: lineTotal,
+      };
+    });
+    if (deliveryFee > 0) {
+      productLines.push({
+        ProductID: 'delivery',
+        Description: 'דמי משלוח',
+        Quantity: 1,
+        UnitCost: deliveryFee,
+        TotalLineCost: deliveryFee,
+      });
+    }
+    const amountRounded = round2(amount);
+    let documentTotal = productLines.reduce((sum, p) => sum + p.TotalLineCost, 0);
+    const diff = round2(amountRounded - documentTotal);
+    if (productLines.length > 0 && Math.abs(diff) > 0.001) {
+      const last = productLines[productLines.length - 1];
+      last.TotalLineCost = round2(last.TotalLineCost + diff);
+      last.UnitCost = last.TotalLineCost;
+    }
+    const documentTotalFinal = productLines.reduce((sum, p) => sum + p.TotalLineCost, 0);
+    log('info', 'init-payment', 'CardCom payload', {
+      Amount: amountRounded,
+      documentTotal: documentTotalFinal,
+      productLinesCount: productLines.length,
+      SuccessRedirectUrl: successRedirectUrl,
+      FailedRedirectUrl: failedRedirectUrl,
+    });
+    const createPayload = {
+      TerminalNumber: Number(CARDCOM_TERMINAL),
+      ApiName: CARDCOM_API_NAME,
+      Operation: 'ChargeOnly',
+      Amount: amountRounded,
+      ProductName: productName,
+      Language: 'he',
+      ISOCoinId: 1,
+      SuccessRedirectUrl: successRedirectUrl,
+      FailedRedirectUrl: failedRedirectUrl,
+      Document: {
+        Name: req.body.customer_name || 'לקוח',
+        Products: productLines,
+        IsAllowEditDocument: false,
+        IsShowOnlyDocument: true,
+        Language: 'he',
+      },
+    };
+    const cardComUrl = `${CARDCOM_URL}/api/v11/LowProfile/create`;
+    log('info', 'init-payment', 'calling CardCom', { url: cardComUrl });
+    let cardRes;
+    let cardJson = {};
+    try {
+      if (process.env.NODE_ENV !== 'production') {
+        const u = new URL(cardComUrl);
+        const body = JSON.stringify(createPayload);
+        const devAgent = new https.Agent({ rejectUnauthorized: false });
+        const [status, data] = await new Promise((resolve, reject) => {
+          const req = https.request(
+            {
+              hostname: u.hostname,
+              port: u.port || 443,
+              path: u.pathname + u.search,
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body, 'utf8') },
+              agent: devAgent,
+            },
+            (res) => {
+              const chunks = [];
+              res.on('data', (c) => chunks.push(c));
+              res.on('end', () => resolve([res.statusCode, Buffer.concat(chunks).toString('utf8')]));
+              res.on('error', reject);
+            }
+          );
+          req.on('error', reject);
+          req.setTimeout(15000, () => { req.destroy(); reject(new Error('CardCom request timeout')); });
+          req.write(body);
+          req.end();
+        });
+        cardRes = { status };
+        try {
+          cardJson = typeof data === 'string' ? JSON.parse(data) : data || {};
+        } catch (_) {
+          cardJson = {};
+        }
+      } else {
+        cardRes = await fetch(cardComUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(createPayload),
+        });
+        cardJson = await cardRes.json().catch(() => ({}));
+      }
+    } catch (fetchErr) {
+      log('error', 'init-payment', 'fetch to CardCom failed', fetchErr.message, { code: fetchErr.code, cause: fetchErr.cause?.message });
+      return res.status(502).json({ error: 'לא ניתן להתחבר לקארדקום. בדוק חיבור רשת.', details: fetchErr.message });
+    }
+    const lowProfileId = cardJson.LowProfileId ?? cardJson.LowProfileID;
+    log('info', 'init-payment', 'CardCom response', { status: cardRes.status, LowProfileId: lowProfileId, ResponseCode: cardJson.ResponseCode });
+    if (!lowProfileId) {
+      const errMsg = cardJson.Description || cardJson.Message || cardJson.Error || cardRes.statusText || 'CardCom error';
+      log('error', 'init-payment', 'CardCom failed', cardRes.status, cardJson);
+      return res.status(502).json({ error: 'לא ניתן ליצור עסקת תשלום. נסו שוב או בחרו מזומן.', details: errMsg });
+    }
+    log('info', 'init-payment', 'success', { LowProfileId: lowProfileId });
+    res.json({ LowProfileId: lowProfileId, terminalNumber: Number(CARDCOM_TERMINAL) });
+  } catch (e) {
+    log('error', 'init-payment', 'exception', e.message, { code: e.code, cause: e.cause?.message });
+    res.status(500).json({ error: e.message || 'שגיאה ביצירת תשלום' });
+  }
+});
+
+app.get('/api/checkout/delivery-slot-counts', async (req, res) => {
+  try {
+    log('info', 'checkout', 'delivery-slot-counts', { referer: req.get('referer')?.slice(0, 50) });
     const { data, error } = await supabase
       .from('orders')
       .select('delivery_time_slot')
@@ -165,8 +338,9 @@ app.get('/api/checkout/delivery-slot-counts', async (_, res) => {
   }
 });
 
-app.get('/api/checkout/express-available', async (_, res) => {
+app.get('/api/checkout/express-available', async (req, res) => {
   try {
+    log('info', 'checkout', 'express-available', { referer: req.get('referer')?.slice(0, 50) });
     const { count, error } = await supabase
       .from('orders')
       .select('id', { count: 'exact', head: true })
@@ -183,7 +357,9 @@ app.get('/api/checkout/express-available', async (_, res) => {
 app.post('/api/orders', async (req, res) => {
   try {
     const { customer_name, customer_phone, delivery_address, delivery_city, payment_method, customer_notes, express_delivery, delivery_time_slot, items } = req.body;
+    log('info', 'orders', 'POST', { payment_method, itemsCount: items?.length });
     if (!customer_name || !customer_phone || !delivery_address || !delivery_city || !payment_method || !items?.length) {
+      log('warn', 'orders', 'missing required fields');
       return res.status(400).json({ error: 'Missing required fields' });
     }
     const express = Boolean(express_delivery);
@@ -242,8 +418,11 @@ app.post('/api/orders', async (req, res) => {
     }));
     const { error: itemsErr } = await supabase.from('order_items').insert(orderItems);
     if (itemsErr) throw itemsErr;
+    log('info', 'orders', 'created', { orderId: order.id, total, payment_method: payment_method });
+    if (payment_method === 'card') log('info', 'orders', 'order created after card payment success');
     res.status(201).json({ orderId: order.id, total });
   } catch (e) {
+    log('error', 'orders', e.message, e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -637,7 +816,8 @@ app.delete('/api/admin/subcategories/:id', async (req, res) => {
 if (!process.env.VERCEL) {
   app.listen(PORT, async () => {
     await ensureProductImagesBucket();
-    console.log(`Backend running at http://localhost:${PORT}`);
+    log('info', 'server', `Listening at http://localhost:${PORT}`);
+    log('info', 'server', 'CardCom', { configured: !!(CARDCOM_TERMINAL && CARDCOM_API_NAME) });
   });
 }
 
