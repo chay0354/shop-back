@@ -5,11 +5,6 @@ import cors from 'cors';
 import multer from 'multer';
 import { supabase } from './supabase.js';
 
-if (process.env.NODE_ENV !== 'production') {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  console.warn('[server] NODE_TLS_REJECT_UNAUTHORIZED=0 (dev only, for CardCom)');
-}
-
 const app = express();
 const PORT = process.env.PORT || 4000;
 
@@ -419,7 +414,11 @@ app.post('/api/orders', async (req, res) => {
     const { error: itemsErr } = await supabase.from('order_items').insert(orderItems);
     if (itemsErr) throw itemsErr;
     log('info', 'orders', 'created', { orderId: order.id, total, payment_method: payment_method });
-    if (payment_method === 'card') log('info', 'orders', 'order created after card payment success');
+    if (payment_method === 'card') {
+      log('info', 'orders', 'PAYMENT SUCCESSFUL – order created after card payment', { orderId: order.id, total });
+      const isTestOrder = Number(total) === 5 && items.length === 1 && items.every((i) => i.product_id == null);
+      if (isTestOrder) log('info', 'orders', 'Test product order – PAYMENT SUCCESSFUL', { orderId: order.id });
+    }
     res.status(201).json({ orderId: order.id, total });
   } catch (e) {
     log('error', 'orders', e.message, e);
@@ -817,7 +816,7 @@ if (!process.env.VERCEL) {
   app.listen(PORT, async () => {
     await ensureProductImagesBucket();
     log('info', 'server', `Listening at http://localhost:${PORT}`);
-    log('info', 'server', 'CardCom', { configured: !!(CARDCOM_TERMINAL && CARDCOM_API_NAME) });
+    log('info', 'server', 'CardCom', { configured: !!(CARDCOM_TERMINAL && CARDCOM_API_NAME), note: 'Use production terminal + API name from CardCom back office for live charges' });
   });
 }
 
