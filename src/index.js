@@ -387,7 +387,7 @@ app.post('/api/orders', async (req, res) => {
     }
     const subtotal = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
     const FREE_SHIPPING_MIN = 279;
-    const DELIVERY_FEE = 30;
+    const DELIVERY_FEE = 15;
     const deliveryFee = subtotal > 0 && subtotal < FREE_SHIPPING_MIN ? DELIVERY_FEE : 0;
     const total = subtotal + deliveryFee;
     const { data: order, error: orderErr } = await supabase
