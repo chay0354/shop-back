@@ -149,6 +149,19 @@ app.get('/api/carousel', async (_, res) => {
   }
 });
 
+app.get('/api/carousel/bottom', async (_, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('home_carousel_bottom')
+      .select('id, image_url, sort_order')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const EXPRESS_NOT_DELIVERED_LIMIT = 5;
 
 async function uploadAdminImage(file, folder) {
@@ -679,6 +692,60 @@ app.delete('/api/admin/carousel/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'שגיאה במחיקת תמונה מהקרוסלה' });
+  }
+});
+
+app.get('/api/admin/carousel/bottom', async (_, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('home_carousel_bottom')
+      .select('id, image_url, sort_order, created_at')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/carousel/bottom', upload.single('image'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file || !file.buffer) {
+      return res.status(400).json({ error: 'נא להעלות קובץ תמונה' });
+    }
+    await ensureProductImagesBucket();
+    const ext = (file.originalname && file.originalname.split('.').pop()) || 'jpg';
+    const safeExt = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext.toLowerCase()) ? ext.toLowerCase() : 'jpg';
+    const path = `carousel-bottom/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`;
+    const { error: uploadErr } = await supabase.storage
+      .from(PRODUCT_IMAGES_BUCKET)
+      .upload(path, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: false });
+    if (uploadErr) throw uploadErr;
+    const { data: urlData } = supabase.storage.from(PRODUCT_IMAGES_BUCKET).getPublicUrl(path);
+    const image_url = urlData?.publicUrl || null;
+    const { data: existing } = await supabase.from('home_carousel_bottom').select('sort_order').order('sort_order', { ascending: false }).limit(1).single();
+    const sort_order = (existing?.sort_order ?? -1) + 1;
+    const { data: row, error } = await supabase
+      .from('home_carousel_bottom')
+      .insert({ image_url, sort_order })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה בהוספת תמונה לקרוסלה התחתונה' });
+  }
+});
+
+app.delete('/api/admin/carousel/bottom/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase.from('home_carousel_bottom').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'שגיאה במחיקת תמונה מהקרוסלה התחתונה' });
   }
 });
 
