@@ -3,10 +3,17 @@ import https from 'https';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import sgMail from '@sendgrid/mail';
 import { supabase } from './supabase.js';
 
 const app = express();
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
+const INVOICE_FROM_EMAIL = process.env.INVOICE_FROM_EMAIL || '';
+
+if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
 const PORT = process.env.PORT || 4000;
+
+const INVOICE_COPY_EMAILS = ['freexbutsa@gmail.com', 'freexazmanot@gmail.com', 'freexkabala@gmail.com'];
 
 function log(level, tag, ...args) {
   const ts = new Date().toISOString();
@@ -14,6 +21,50 @@ function log(level, tag, ...args) {
   if (level === 'error') console.error(prefix, ...args);
   else if (level === 'warn') console.warn(prefix, ...args);
   else console.log(prefix, ...args);
+}
+
+async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, deliveryAddress, deliveryCity, deliveryTimeSlot, paymentMethod }) {
+  if (!SENDGRID_API_KEY || !INVOICE_FROM_EMAIL) return;
+  const recipients = [...(to ? [to] : []), ...INVOICE_COPY_EMAILS];
+  if (recipients.length === 0) return;
+  const rows = (items || []).map((i) => {
+    const qty = Number(i.quantity) || 1;
+    const price = Number(i.unit_price) || 0;
+    const lineTotal = (qty * price).toFixed(2);
+    const name = (i.product_name_he || i.name_he || 'פריט').replace(/</g, '&lt;');
+    return `<tr><td>${name}</td><td>${qty}</td><td>₪${price.toFixed(2)}</td><td>₪${lineTotal}</td></tr>`;
+  }).join('');
+  const paymentLabel = paymentMethod === 'card' ? 'כרטיס אשראי' : 'מזומן במשלוח';
+  const html = `
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head><meta charset="utf-8"><title>חשבונית הזמנה ${orderId}</title></head>
+<body style="font-family:Heebo,sans-serif;padding:1rem;max-width:500px;margin:0 auto;">
+  <h1 style="font-size:1.25rem;">חשבונית / אישור הזמנה</h1>
+  <p><strong>מספר הזמנה:</strong> ${orderId}</p>
+  <p><strong>שם:</strong> ${String(customerName || '').replace(/</g, '&lt;')}</p>
+  <p><strong>כתובת:</strong> ${String(deliveryAddress || '').replace(/</g, '&lt;')}, ${String(deliveryCity || '').replace(/</g, '&lt;')}</p>
+  ${deliveryTimeSlot ? `<p><strong>שעת משלוח:</strong> ${String(deliveryTimeSlot).replace(/</g, '&lt;')}</p>` : ''}
+  <p><strong>אמצעי תשלום:</strong> ${paymentLabel}</p>
+  <table style="width:100%;border-collapse:collapse;margin:1rem 0;">
+    <thead><tr style="border-bottom:2px solid #ddd;"><th style="text-align:right;">פריט</th><th>כמות</th><th>מחיר</th><th>סה"כ</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <p style="font-size:1.1rem;"><strong>סה"כ לתשלום: ₪${Number(total).toFixed(2)}</strong></p>
+  <p style="color:#666;font-size:0.9rem;">תודה שקנית אצלנו.</p>
+</body>
+</html>`;
+  try {
+    await sgMail.send({
+      to: recipients,
+      from: INVOICE_FROM_EMAIL,
+      subject: `אישור הזמנה #${orderId} – קריות מרקט`,
+      html,
+    });
+    log('info', 'invoice-email', 'sent', { to: recipients, orderId });
+  } catch (err) {
+    log('error', 'invoice-email', err.message, { to: recipients, orderId });
+  }
 }
 
 app.use((req, res, next) => {
@@ -177,7 +228,7 @@ async function uploadAdminImage(file, folder) {
   return data?.publicUrl || null;
 }
 
-const MAX_ORDERS_PER_DELIVERY_SLOT = 5;
+const MAX_ORDERS_PER_DELIVERY_SLOT = 1;
 
 const CARDCOM_TERMINAL = process.env.CARDCOM_TERMINAL_NUMBER || '';
 const CARDCOM_API_NAME = process.env.CARDCOM_API_NAME || '';
@@ -364,7 +415,7 @@ app.get('/api/checkout/express-available', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const { customer_name, customer_phone, delivery_address, delivery_city, payment_method, customer_notes, express_delivery, delivery_time_slot, items } = req.body;
+    const { customer_name, customer_phone, customer_email, delivery_address, delivery_city, payment_method, customer_notes, express_delivery, delivery_time_slot, items } = req.body;
     log('info', 'orders', 'POST', { payment_method, itemsCount: items?.length });
     if (!customer_name || !customer_phone || !delivery_address || !delivery_city || !payment_method || !items?.length) {
       log('warn', 'orders', 'missing required fields');
@@ -390,7 +441,7 @@ app.post('/api/orders', async (req, res) => {
         .eq('delivery_time_slot', slotKey);
       if (slotErr) throw slotErr;
       if ((slotCount ?? 0) >= MAX_ORDERS_PER_DELIVERY_SLOT) {
-        return res.status(400).json({ error: 'שעת המשלוח שנבחרה מלאה (5 הזמנות). בחרו שעה אחרת.' });
+        return res.status(400).json({ error: 'שעת המשלוח שנבחרה תפוסה. בחרו שעה אחרת.' });
       }
     }
     const subtotal = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
@@ -432,6 +483,18 @@ app.post('/api/orders', async (req, res) => {
       const isTestOrder = Number(total) === 5 && items.length === 1 && items.every((i) => i.product_id == null);
       if (isTestOrder) log('info', 'orders', 'Test product order – PAYMENT SUCCESSFUL', { orderId: order.id });
     }
+    const toEmail = typeof customer_email === 'string' ? customer_email.trim() : '';
+    sendOrderInvoiceEmail({
+      to: toEmail || undefined,
+      orderId: order.id,
+      customerName: customer_name,
+      items,
+      total,
+      deliveryAddress: delivery_address,
+      deliveryCity: delivery_city,
+      deliveryTimeSlot: delivery_time_slot || null,
+      paymentMethod: payment_method,
+    }).catch(() => {});
     res.status(201).json({ orderId: order.id, total });
   } catch (e) {
     log('error', 'orders', e.message, e);
@@ -884,6 +947,7 @@ if (!process.env.VERCEL) {
     await ensureProductImagesBucket();
     log('info', 'server', `Listening at http://localhost:${PORT}`);
     log('info', 'server', 'CardCom', { configured: !!(CARDCOM_TERMINAL && CARDCOM_API_NAME), note: 'Use production terminal + API name from CardCom back office for live charges' });
+    log('info', 'server', 'SendGrid invoice email', { configured: !!(SENDGRID_API_KEY && INVOICE_FROM_EMAIL) });
   });
 }
 
