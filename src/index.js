@@ -213,7 +213,111 @@ app.get('/api/carousel/bottom', async (_, res) => {
   }
 });
 
-const EXPRESS_NOT_DELIVERED_LIMIT = 5;
+const EXPRESS_DAILY_LIMIT_DEFAULT = 5;
+
+function getTodayUtcRange() {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function getTodayDateKey() {
+  const { start } = getTodayUtcRange();
+  return start.slice(0, 10);
+}
+
+const DELIVERY_HOUR_START = 8;
+const DELIVERY_HOUR_END = 20;
+
+function defaultSlotLimits() {
+  const o = {};
+  for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) o[h] = 1;
+  return o;
+}
+
+function parseSlotLimits(raw) {
+  const out = defaultSlotLimits();
+  if (!raw) return out;
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (parsed && typeof parsed === 'object') {
+      for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) {
+        const v = parsed[h] ?? parsed[String(h)];
+        const n = parseInt(v, 10);
+        out[h] = Number.isFinite(n) && n >= 0 ? n : 1;
+      }
+    }
+  } catch (_) {}
+  return out;
+}
+
+async function getSettings() {
+  try {
+    const { data, error } = await supabase.from('settings').select('key, value');
+    if (error) return { express_daily_limit: EXPRESS_DAILY_LIMIT_DEFAULT, slot_limits: defaultSlotLimits() };
+    const map = {};
+    for (const row of data || []) map[row.key] = row.value;
+    const todayKey = getTodayDateKey();
+    const lastResetDate = (map.slot_limits_reset_date || '').trim();
+    if (lastResetDate !== todayKey) {
+      const defaults = defaultSlotLimits();
+      const expressMax = Math.max(0, parseInt(map.express_daily_limit_max, 10) || parseInt(map.express_daily_limit, 10) || EXPRESS_DAILY_LIMIT_DEFAULT);
+      await supabase.from('settings').upsert([
+        { key: 'slot_limits', value: JSON.stringify(defaults) },
+        { key: 'slot_limits_reset_date', value: todayKey },
+        { key: 'express_daily_limit', value: String(expressMax) },
+      ], { onConflict: 'key' });
+      return {
+        express_daily_limit: expressMax,
+        slot_limits: defaults,
+        delivery_blocked: (map.delivery_blocked || '').toLowerCase() === 'true',
+      };
+    }
+    const remaining = parseInt(map.express_daily_limit, 10);
+    const delivery_blocked = (map.delivery_blocked || '').toLowerCase() === 'true';
+    return {
+      express_daily_limit: Number.isFinite(remaining) && remaining >= 0 ? remaining : EXPRESS_DAILY_LIMIT_DEFAULT,
+      slot_limits: parseSlotLimits(map.slot_limits),
+      delivery_blocked,
+    };
+  } catch (_) {
+    return { express_daily_limit: EXPRESS_DAILY_LIMIT_DEFAULT, slot_limits: defaultSlotLimits(), delivery_blocked: false };
+  }
+}
+
+async function setExpressDailyLimit(limit) {
+  const n = Math.max(0, parseInt(limit, 10) || 0);
+  const value = String(n);
+  await supabase.from('settings').upsert([
+    { key: 'express_daily_limit', value },
+    { key: 'express_daily_limit_max', value },
+  ], { onConflict: 'key' });
+}
+
+async function decrementExpressRemaining() {
+  const { data, error } = await supabase.from('settings').select('value').eq('key', 'express_daily_limit').single();
+  if (error || !data) return;
+  const current = Math.max(0, parseInt(data.value, 10) || 0);
+  const next = Math.max(0, current - 1);
+  await supabase.from('settings').upsert({ key: 'express_daily_limit', value: String(next) }, { onConflict: 'key' });
+}
+
+async function setSlotLimits(limits) {
+  const normalized = parseSlotLimits(limits);
+  const value = JSON.stringify(normalized);
+  const todayKey = getTodayDateKey();
+  await supabase.from('settings').upsert([
+    { key: 'slot_limits', value },
+    { key: 'slot_limits_reset_date', value: todayKey },
+  ], { onConflict: 'key' });
+}
+
+async function setDeliveryBlocked(blocked) {
+  const value = blocked ? 'true' : 'false';
+  await supabase.from('settings').upsert({ key: 'delivery_blocked', value }, { onConflict: 'key' });
+}
 
 async function uploadAdminImage(file, folder) {
   await ensureProductImagesBucket();
@@ -228,14 +332,14 @@ async function uploadAdminImage(file, folder) {
   return data?.publicUrl || null;
 }
 
-const MAX_ORDERS_PER_DELIVERY_SLOT = 1;
-
 const CARDCOM_TERMINAL = process.env.CARDCOM_TERMINAL_NUMBER || '';
 const CARDCOM_API_NAME = process.env.CARDCOM_API_NAME || '';
 const CARDCOM_URL = (process.env.CARDCOM_URL || 'https://secure.cardcom.solutions').replace(/\/$/, '');
 
 app.post('/api/checkout/init-payment', async (req, res) => {
   try {
+    const { delivery_blocked } = await getSettings();
+    if (delivery_blocked) return res.status(400).json({ error: DELIVERY_BLOCKED_MESSAGE });
     const amount = Number(req.body.amount);
     log('info', 'init-payment', 'request', {
       amount,
@@ -378,9 +482,21 @@ app.post('/api/checkout/init-payment', async (req, res) => {
   }
 });
 
+const DELIVERY_BLOCKED_MESSAGE = 'משלוחים לא זמינים כעת, נסה שוב מאוחר יותר';
+
+app.get('/api/checkout/orders-available', async (req, res) => {
+  try {
+    const { delivery_blocked } = await getSettings();
+    res.json({ available: !delivery_blocked, message: delivery_blocked ? DELIVERY_BLOCKED_MESSAGE : null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/checkout/delivery-slot-counts', async (req, res) => {
   try {
     log('info', 'checkout', 'delivery-slot-counts', { referer: req.get('referer')?.slice(0, 50) });
+    const { slot_limits } = await getSettings();
     const { data, error } = await supabase
       .from('orders')
       .select('delivery_time_slot')
@@ -391,7 +507,7 @@ app.get('/api/checkout/delivery-slot-counts', async (req, res) => {
       const key = String(row.delivery_time_slot).trim();
       if (key) counts[key] = (counts[key] || 0) + 1;
     }
-    res.json(counts);
+    res.json({ counts, slot_limits });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -400,14 +516,8 @@ app.get('/api/checkout/delivery-slot-counts', async (req, res) => {
 app.get('/api/checkout/express-available', async (req, res) => {
   try {
     log('info', 'checkout', 'express-available', { referer: req.get('referer')?.slice(0, 50) });
-    const { count, error } = await supabase
-      .from('orders')
-      .select('id', { count: 'exact', head: true })
-      .eq('express_delivery', true)
-      .eq('order_status', 'not_supplied');
-    if (error) throw error;
-    const available = (count ?? 0) < EXPRESS_NOT_DELIVERED_LIMIT;
-    res.json({ available });
+    const { express_daily_limit } = await getSettings();
+    res.json({ available: express_daily_limit > 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -415,6 +525,8 @@ app.get('/api/checkout/express-available', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
+    const { delivery_blocked } = await getSettings();
+    if (delivery_blocked) return res.status(400).json({ error: DELIVERY_BLOCKED_MESSAGE });
     const { customer_name, customer_phone, customer_email, delivery_address, delivery_city, payment_method, customer_notes, express_delivery, delivery_time_slot, items } = req.body;
     log('info', 'orders', 'POST', { payment_method, itemsCount: items?.length });
     if (!customer_name || !customer_phone || !delivery_address || !delivery_city || !payment_method || !items?.length) {
@@ -423,24 +535,23 @@ app.post('/api/orders', async (req, res) => {
     }
     const express = Boolean(express_delivery);
     if (express) {
-      const { count, error: countErr } = await supabase
-        .from('orders')
-        .select('id', { count: 'exact', head: true })
-        .eq('express_delivery', true)
-        .eq('order_status', 'not_supplied');
-      if (countErr) throw countErr;
-      if ((count ?? 0) >= EXPRESS_NOT_DELIVERED_LIMIT) {
-        return res.status(400).json({ error: 'משלוח אקספרס לא זמין כרגע. הגבול של 5 הזמנות אקספרס שלא סופקו התמלא.' });
+      const { express_daily_limit } = await getSettings();
+      if (express_daily_limit <= 0) {
+        return res.status(400).json({ error: 'משלוח אקספרס לא זמין כרגע. הגבול היומי של הזמנות אקספרס התמלא.' });
       }
     }
     if (delivery_time_slot) {
+      const { slot_limits } = await getSettings();
       const slotKey = String(delivery_time_slot).trim();
+      const hourPart = slotKey.split(/\s+/).pop();
+      const hour = parseInt(hourPart, 10);
+      const maxForHour = (Number.isFinite(hour) && slot_limits[hour] !== undefined) ? slot_limits[hour] : 1;
       const { count: slotCount, error: slotErr } = await supabase
         .from('orders')
         .select('id', { count: 'exact', head: true })
         .eq('delivery_time_slot', slotKey);
       if (slotErr) throw slotErr;
-      if ((slotCount ?? 0) >= MAX_ORDERS_PER_DELIVERY_SLOT) {
+      if ((slotCount ?? 0) >= maxForHour) {
         return res.status(400).json({ error: 'שעת המשלוח שנבחרה תפוסה. בחרו שעה אחרת.' });
       }
     }
@@ -467,6 +578,7 @@ app.post('/api/orders', async (req, res) => {
       .select('id')
       .single();
     if (orderErr) throw orderErr;
+    if (express) await decrementExpressRemaining();
     const orderItems = items.map((i) => ({
       order_id: order.id,
       product_id: i.product_id || null,
@@ -498,6 +610,58 @@ app.post('/api/orders', async (req, res) => {
     res.status(201).json({ orderId: order.id, total });
   } catch (e) {
     log('error', 'orders', e.message, e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: usage counts (not_supplied only — decreases when order marked supplied)
+app.get('/api/admin/usage', async (_, res) => {
+  try {
+    const { data: slotRows, error: slotErr } = await supabase
+      .from('orders')
+      .select('delivery_time_slot')
+      .not('delivery_time_slot', 'is', null)
+      .neq('order_status', 'supplied');
+    if (slotErr) throw slotErr;
+    const slot_counts = {};
+    for (const row of slotRows || []) {
+      const key = String(row.delivery_time_slot).trim();
+      if (key) slot_counts[key] = (slot_counts[key] || 0) + 1;
+    }
+    const { start, end } = getTodayUtcRange();
+    const { count: express_count, error: expressErr } = await supabase
+      .from('orders')
+      .select('id', { count: 'exact', head: true })
+      .eq('express_delivery', true)
+      .neq('order_status', 'supplied')
+      .gte('created_at', start)
+      .lt('created_at', end);
+    if (expressErr) throw expressErr;
+    res.json({ slot_counts, express_count: express_count ?? 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: get/update settings (e.g. express daily limit)
+app.get('/api/admin/settings', async (_, res) => {
+  try {
+    const settings = await getSettings();
+    res.json(settings);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/admin/settings', async (req, res) => {
+  try {
+    const { express_daily_limit, slot_limits, delivery_blocked } = req.body;
+    if (express_daily_limit !== undefined) await setExpressDailyLimit(express_daily_limit);
+    if (slot_limits !== undefined && typeof slot_limits === 'object') await setSlotLimits(slot_limits);
+    if (delivery_blocked !== undefined) await setDeliveryBlocked(!!delivery_blocked);
+    const settings = await getSettings();
+    res.json(settings);
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
