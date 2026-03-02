@@ -716,6 +716,19 @@ app.patch('/api/admin/orders/:id', async (req, res) => {
   }
 });
 
+app.delete('/api/admin/orders/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error: itemsErr } = await supabase.from('order_items').delete().eq('order_id', id);
+    if (itemsErr) throw itemsErr;
+    const { error: orderErr } = await supabase.from('orders').delete().eq('id', id);
+    if (orderErr) throw orderErr;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PRODUCT_IMAGES_BUCKET = 'product-images';
 
 async function ensureProductImagesBucket() {
