@@ -24,7 +24,10 @@ function log(level, tag, ...args) {
 }
 
 async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, deliveryAddress, deliveryCity, deliveryTimeSlot, paymentMethod }) {
-  if (!SENDGRID_API_KEY || !INVOICE_FROM_EMAIL) return;
+  if (!SENDGRID_API_KEY || !INVOICE_FROM_EMAIL) {
+    log('info', 'invoice-email', 'skipped – no SendGrid config', { orderId, hasKey: !!SENDGRID_API_KEY, hasFrom: !!INVOICE_FROM_EMAIL });
+    return;
+  }
   // Send to customer (when provided) and to the 3 copy addresses; dedupe by lowercase
   const userEmail = typeof to === 'string' ? to.trim() : '';
   const allEmails = [...(userEmail ? [userEmail] : []), ...INVOICE_COPY_EMAILS];
@@ -35,7 +38,11 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
     seen.add(key);
     return true;
   });
-  if (recipients.length === 0) return;
+  if (recipients.length === 0) {
+    log('info', 'invoice-email', 'skipped – no recipients', { orderId });
+    return;
+  }
+  log('info', 'invoice-email', 'sending', { orderId, recipients, recipientCount: recipients.length });
   const rows = (items || []).map((i) => {
     const qty = Number(i.quantity) || 1;
     const price = Number(i.unit_price) || 0;
@@ -70,9 +77,10 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
       subject: `אישור הזמנה #${orderId} – פריקס ישראל`,
       html,
     });
-    log('info', 'invoice-email', 'sent', { to: recipients, orderId });
+    log('info', 'invoice-email', 'sent OK', { orderId, recipients, recipientCount: recipients.length });
   } catch (err) {
-    log('error', 'invoice-email', err.message, { to: recipients, orderId });
+    log('error', 'invoice-email', 'send failed', { orderId, error: err.message, recipients, recipientCount: recipients.length });
+    throw err;
   }
 }
 
@@ -528,6 +536,27 @@ app.get('/api/checkout/express-available', async (req, res) => {
     const { express_daily_limit } = await getSettings();
     res.json({ available: express_daily_limit > 0 });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Public: resolve order id (UUID) or number to display order number only
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+app.get('/api/orders/public/:id', async (req, res) => {
+  try {
+    const id = req.params.id?.trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    if (UUID_REGEX.test(id)) {
+      const { data, error } = await supabase.from('orders').select('order_number').eq('id', id).maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data) return res.status(404).json({ error: 'Not found' });
+      return res.json({ orderNumber: data.order_number });
+    }
+    const num = parseInt(id, 10);
+    if (Number.isFinite(num)) return res.json({ orderNumber: num });
+    return res.status(400).json({ error: 'Invalid id' });
+  } catch (e) {
+    log('error', 'orders-public', e.message);
     res.status(500).json({ error: e.message });
   }
 });
