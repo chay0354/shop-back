@@ -23,9 +23,11 @@ function log(level, tag, ...args) {
   else console.log(prefix, ...args);
 }
 
-async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, deliveryAddress, deliveryCity, deliveryTimeSlot, paymentMethod }) {
+async function sendOrderInvoiceEmail({ to, orderDisplayNumber, orderIdForLog, customerName, items, total, deliveryAddress, deliveryCity, deliveryTimeSlot, paymentMethod }) {
+  // orderDisplayNumber = numeric מזהה הזמנה shown in email (e.g. 62020). Never use UUID here.
+  const displayId = orderDisplayNumber != null ? String(orderDisplayNumber) : '';
   if (!SENDGRID_API_KEY || !INVOICE_FROM_EMAIL) {
-    log('info', 'invoice-email', 'skipped – no SendGrid config', { orderId, hasKey: !!SENDGRID_API_KEY, hasFrom: !!INVOICE_FROM_EMAIL });
+    log('info', 'invoice-email', 'skipped – no SendGrid config', { orderDisplayNumber: displayId, orderIdForLog, hasKey: !!SENDGRID_API_KEY, hasFrom: !!INVOICE_FROM_EMAIL });
     return;
   }
   // Send to customer (when provided) and to the 3 copy addresses; dedupe by lowercase
@@ -39,10 +41,10 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
     return true;
   });
   if (recipients.length === 0) {
-    log('info', 'invoice-email', 'skipped – no recipients', { orderId });
+    log('info', 'invoice-email', 'skipped – no recipients', { orderDisplayNumber: displayId });
     return;
   }
-  log('info', 'invoice-email', 'sending', { orderId, recipients, recipientCount: recipients.length });
+  log('info', 'invoice-email', 'sending', { orderDisplayNumber: displayId, orderIdForLog, recipients, recipientCount: recipients.length });
   const rows = (items || []).map((i) => {
     const qty = Number(i.quantity) || 1;
     const price = Number(i.unit_price) || 0;
@@ -54,10 +56,10 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
   const html = `
 <!DOCTYPE html>
 <html dir="rtl" lang="he">
-<head><meta charset="utf-8"><title>חשבונית הזמנה ${orderId}</title></head>
+<head><meta charset="utf-8"><title>חשבונית הזמנה ${displayId}</title></head>
 <body style="font-family:Heebo,sans-serif;padding:1rem;max-width:500px;margin:0 auto;">
   <h1 style="font-size:1.25rem;">חשבונית / אישור הזמנה</h1>
-  <p><strong>מזהה הזמנה:</strong> ${orderId}</p>
+  <p><strong>מזהה הזמנה:</strong> ${displayId}</p>
   <p><strong>שם:</strong> ${String(customerName || '').replace(/</g, '&lt;')}</p>
   <p><strong>כתובת:</strong> ${String(deliveryAddress || '').replace(/</g, '&lt;')}, ${String(deliveryCity || '').replace(/</g, '&lt;')}</p>
   ${deliveryTimeSlot ? `<p><strong>שעת משלוח:</strong> ${String(deliveryTimeSlot).replace(/</g, '&lt;')}</p>` : ''}
@@ -74,12 +76,12 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
     await sgMail.send({
       to: recipients,
       from: INVOICE_FROM_EMAIL,
-      subject: `אישור הזמנה #${orderId} – פריקס ישראל`,
+      subject: `אישור הזמנה #${displayId} – פריקס ישראל`,
       html,
     });
-    log('info', 'invoice-email', 'sent OK', { orderId, recipients, recipientCount: recipients.length });
+    log('info', 'invoice-email', 'sent OK', { orderDisplayNumber: displayId, orderIdForLog, recipients, recipientCount: recipients.length });
   } catch (err) {
-    log('error', 'invoice-email', 'send failed', { orderId, error: err.message, recipients, recipientCount: recipients.length });
+    log('error', 'invoice-email', 'send failed', { orderDisplayNumber: displayId, orderIdForLog, error: err.message, recipients, recipientCount: recipients.length });
     throw err;
   }
 }
@@ -641,7 +643,8 @@ app.post('/api/orders', async (req, res) => {
     try {
       await sendOrderInvoiceEmail({
         to: toEmail || undefined,
-        orderId: String(orderNumber),
+        orderDisplayNumber: orderNumber,
+        orderIdForLog: order.id,
         customerName: customer_name,
         items,
         total,
@@ -651,7 +654,7 @@ app.post('/api/orders', async (req, res) => {
         paymentMethod: payment_method,
       });
     } catch (emailErr) {
-      log('error', 'invoice-email', emailErr.message, { orderId: orderNumber });
+      log('error', 'invoice-email', emailErr.message, { orderNumber, orderId: order.id });
     }
     res.status(201).json({ orderId: order.id, orderNumber: orderNumber, total });
   } catch (e) {
