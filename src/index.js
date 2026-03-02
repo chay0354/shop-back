@@ -25,7 +25,16 @@ function log(level, tag, ...args) {
 
 async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, deliveryAddress, deliveryCity, deliveryTimeSlot, paymentMethod }) {
   if (!SENDGRID_API_KEY || !INVOICE_FROM_EMAIL) return;
-  const recipients = [...(to ? [to] : []), ...INVOICE_COPY_EMAILS];
+  // Send to customer (when provided) and to the 3 copy addresses; dedupe by lowercase
+  const userEmail = typeof to === 'string' ? to.trim() : '';
+  const allEmails = [...(userEmail ? [userEmail] : []), ...INVOICE_COPY_EMAILS];
+  const seen = new Set();
+  const recipients = allEmails.filter((e) => {
+    const key = e.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   if (recipients.length === 0) return;
   const rows = (items || []).map((i) => {
     const qty = Number(i.quantity) || 1;
@@ -41,7 +50,7 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
 <head><meta charset="utf-8"><title>חשבונית הזמנה ${orderId}</title></head>
 <body style="font-family:Heebo,sans-serif;padding:1rem;max-width:500px;margin:0 auto;">
   <h1 style="font-size:1.25rem;">חשבונית / אישור הזמנה</h1>
-  <p><strong>מספר הזמנה:</strong> ${orderId}</p>
+  <p><strong>מזהה הזמנה:</strong> ${orderId}</p>
   <p><strong>שם:</strong> ${String(customerName || '').replace(/</g, '&lt;')}</p>
   <p><strong>כתובת:</strong> ${String(deliveryAddress || '').replace(/</g, '&lt;')}, ${String(deliveryCity || '').replace(/</g, '&lt;')}</p>
   ${deliveryTimeSlot ? `<p><strong>שעת משלוח:</strong> ${String(deliveryTimeSlot).replace(/</g, '&lt;')}</p>` : ''}
@@ -600,17 +609,21 @@ app.post('/api/orders', async (req, res) => {
       if (isTestOrder) log('info', 'orders', 'Test product order – PAYMENT SUCCESSFUL', { orderId: order.id });
     }
     const toEmail = typeof customer_email === 'string' ? customer_email.trim() : '';
-    sendOrderInvoiceEmail({
-      to: toEmail || undefined,
-      orderId: String(orderNumber),
-      customerName: customer_name,
-      items,
-      total,
-      deliveryAddress: delivery_address,
-      deliveryCity: delivery_city,
-      deliveryTimeSlot: delivery_time_slot || null,
-      paymentMethod: payment_method,
-    }).catch(() => {});
+    try {
+      await sendOrderInvoiceEmail({
+        to: toEmail || undefined,
+        orderId: String(orderNumber),
+        customerName: customer_name,
+        items,
+        total,
+        deliveryAddress: delivery_address,
+        deliveryCity: delivery_city,
+        deliveryTimeSlot: delivery_time_slot || null,
+        paymentMethod: payment_method,
+      });
+    } catch (emailErr) {
+      log('error', 'invoice-email', emailErr.message, { orderId: orderNumber });
+    }
     res.status(201).json({ orderId: order.id, orderNumber: orderNumber, total });
   } catch (e) {
     log('error', 'orders', e.message, e);
