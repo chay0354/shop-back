@@ -600,28 +600,46 @@ app.post('/api/orders', async (req, res) => {
     const DELIVERY_FEE = 15;
     const deliveryFee = subtotal > 0 && subtotal < FREE_SHIPPING_MIN ? DELIVERY_FEE : 0;
     const total = subtotal + deliveryFee;
-    const { data: maxRow } = await supabase.from('orders').select('order_number').order('order_number', { ascending: false }).limit(1).maybeSingle();
-    const nextOrderNumber = ((maxRow?.order_number ?? 61999) + 1);
-    const { data: order, error: orderErr } = await supabase
-      .from('orders')
-      .insert({
-        customer_name,
-        customer_phone,
-        delivery_address,
-        delivery_city,
-        payment_method,
-        customer_notes: customer_notes || null,
-        express_delivery: express,
-        order_status: 'not_supplied',
-        delivery_time_slot: delivery_time_slot || null,
-        total: total.toFixed(2),
-        status: 'new',
-        order_number: nextOrderNumber,
-      })
-      .select('id, order_number')
-      .single();
+    // Assign next order_number (62021, 62022, ...). Ignore nulls when taking max; retry on unique conflict.
+    const getNextOrderNumber = async () => {
+      const { data: maxRow } = await supabase.from('orders').select('order_number').not('order_number', 'is', null).order('order_number', { ascending: false }).limit(1).maybeSingle();
+      return (maxRow?.order_number ?? 62020) + 1;
+    };
+    let order;
+    let orderErr;
+    let orderNumberFinal;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const nextOrderNumber = await getNextOrderNumber();
+      const result = await supabase
+        .from('orders')
+        .insert({
+          customer_name,
+          customer_phone,
+          delivery_address,
+          delivery_city,
+          payment_method,
+          customer_notes: customer_notes || null,
+          express_delivery: express,
+          order_status: 'not_supplied',
+          delivery_time_slot: delivery_time_slot || null,
+          total: total.toFixed(2),
+          status: 'new',
+          order_number: nextOrderNumber,
+        })
+        .select('id, order_number')
+        .single();
+      order = result.data;
+      orderErr = result.error;
+      if (!orderErr) {
+        orderNumberFinal = order.order_number ?? nextOrderNumber;
+        break;
+      }
+      const isUniqueViolation = orderErr.code === '23505' || String(orderErr.message || '').includes('unique');
+      if (!isUniqueViolation) break;
+      log('warn', 'orders', 'order_number conflict, retrying', { attempt: attempt + 1, nextOrderNumber });
+    }
     if (orderErr) throw orderErr;
-    const orderNumber = order.order_number ?? nextOrderNumber;
+    const orderNumber = orderNumberFinal ?? order?.order_number;
     if (express) await decrementExpressRemaining();
     const orderItems = items.map((i) => ({
       order_id: order.id,
