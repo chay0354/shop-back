@@ -58,7 +58,7 @@ async function sendOrderInvoiceEmail({ to, orderId, customerName, items, total, 
     await sgMail.send({
       to: recipients,
       from: INVOICE_FROM_EMAIL,
-      subject: `אישור הזמנה #${orderId} – קריות מרקט`,
+      subject: `אישור הזמנה #${orderId} – פריקס ישראל`,
       html,
     });
     log('info', 'invoice-email', 'sent', { to: recipients, orderId });
@@ -560,6 +560,8 @@ app.post('/api/orders', async (req, res) => {
     const DELIVERY_FEE = 15;
     const deliveryFee = subtotal > 0 && subtotal < FREE_SHIPPING_MIN ? DELIVERY_FEE : 0;
     const total = subtotal + deliveryFee;
+    const { data: maxRow } = await supabase.from('orders').select('order_number').order('order_number', { ascending: false }).limit(1).maybeSingle();
+    const nextOrderNumber = ((maxRow?.order_number ?? 61999) + 1);
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .insert({
@@ -574,10 +576,12 @@ app.post('/api/orders', async (req, res) => {
         delivery_time_slot: delivery_time_slot || null,
         total: total.toFixed(2),
         status: 'new',
+        order_number: nextOrderNumber,
       })
-      .select('id')
+      .select('id, order_number')
       .single();
     if (orderErr) throw orderErr;
+    const orderNumber = order.order_number ?? nextOrderNumber;
     if (express) await decrementExpressRemaining();
     const orderItems = items.map((i) => ({
       order_id: order.id,
@@ -598,7 +602,7 @@ app.post('/api/orders', async (req, res) => {
     const toEmail = typeof customer_email === 'string' ? customer_email.trim() : '';
     sendOrderInvoiceEmail({
       to: toEmail || undefined,
-      orderId: order.id,
+      orderId: String(orderNumber),
       customerName: customer_name,
       items,
       total,
@@ -607,7 +611,7 @@ app.post('/api/orders', async (req, res) => {
       deliveryTimeSlot: delivery_time_slot || null,
       paymentMethod: payment_method,
     }).catch(() => {});
-    res.status(201).json({ orderId: order.id, total });
+    res.status(201).json({ orderId: order.id, orderNumber: orderNumber, total });
   } catch (e) {
     log('error', 'orders', e.message, e);
     res.status(500).json({ error: e.message });
