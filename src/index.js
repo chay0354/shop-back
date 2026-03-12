@@ -247,12 +247,11 @@ function getTodayDateKey() {
   return start.slice(0, 10);
 }
 
-const DELIVERY_HOUR_START = 8;
-const DELIVERY_HOUR_END = 20;
+const DELIVERY_SLOT_KEYS = ['10-14', '14-18', '18-22'];
 
 function defaultSlotLimits() {
   const o = {};
-  for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) o[h] = 1;
+  for (const k of DELIVERY_SLOT_KEYS) o[k] = 1;
   return o;
 }
 
@@ -262,10 +261,10 @@ function parseSlotLimits(raw) {
   try {
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (parsed && typeof parsed === 'object') {
-      for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) {
-        const v = parsed[h] ?? parsed[String(h)];
+      for (const k of DELIVERY_SLOT_KEYS) {
+        const v = parsed[k];
         const n = parseInt(v, 10);
-        out[h] = Number.isFinite(n) && n >= 0 ? n : 1;
+        out[k] = Number.isFinite(n) && n >= 0 ? n : 1;
       }
     }
   } catch (_) {}
@@ -583,16 +582,15 @@ app.post('/api/orders', async (req, res) => {
     if (delivery_time_slot) {
       const { slot_limits } = await getSettings();
       const slotKey = String(delivery_time_slot).trim();
-      const hourPart = slotKey.split(/\s+/).pop();
-      const hour = parseInt(hourPart, 10);
-      const maxForHour = (Number.isFinite(hour) && slot_limits[hour] !== undefined) ? slot_limits[hour] : 1;
+      const rangeKey = slotKey.split(/\s+/).pop();
+      const maxForSlot = (rangeKey && slot_limits[rangeKey] !== undefined) ? slot_limits[rangeKey] : 1;
       const { count: slotCount, error: slotErr } = await supabase
         .from('orders')
         .select('id', { count: 'exact', head: true })
         .eq('delivery_time_slot', slotKey);
       if (slotErr) throw slotErr;
-      if ((slotCount ?? 0) >= maxForHour) {
-        return res.status(400).json({ error: 'שעת המשלוח שנבחרה תפוסה. בחרו שעה אחרת.' });
+      if ((slotCount ?? 0) >= maxForSlot) {
+        return res.status(400).json({ error: 'חלון המשלוח שנבחר תפוס. בחרו חלון אחר.' });
       }
     }
     const subtotal = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
