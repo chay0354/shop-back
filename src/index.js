@@ -247,11 +247,14 @@ function getTodayDateKey() {
   return start.slice(0, 10);
 }
 
-const DELIVERY_SLOT_KEYS = ['10-14', '14-18', '18-22'];
+const DELIVERY_HOUR_START = 8;
+const DELIVERY_HOUR_END = 20;
+const TOMORROW_SLOT_KEYS = ['10-14', '14-18', '18-22'];
 
 function defaultSlotLimits() {
   const o = {};
-  for (const k of DELIVERY_SLOT_KEYS) o[k] = 1;
+  for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) o[h] = 1;
+  for (const k of TOMORROW_SLOT_KEYS) o[k] = 1;
   return o;
 }
 
@@ -261,7 +264,12 @@ function parseSlotLimits(raw) {
   try {
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (parsed && typeof parsed === 'object') {
-      for (const k of DELIVERY_SLOT_KEYS) {
+      for (let h = DELIVERY_HOUR_START; h <= DELIVERY_HOUR_END; h++) {
+        const v = parsed[h] ?? parsed[String(h)];
+        const n = parseInt(v, 10);
+        out[h] = Number.isFinite(n) && n >= 0 ? n : 1;
+      }
+      for (const k of TOMORROW_SLOT_KEYS) {
         const v = parsed[k];
         const n = parseInt(v, 10);
         out[k] = Number.isFinite(n) && n >= 0 ? n : 1;
@@ -582,15 +590,17 @@ app.post('/api/orders', async (req, res) => {
     if (delivery_time_slot) {
       const { slot_limits } = await getSettings();
       const slotKey = String(delivery_time_slot).trim();
-      const rangeKey = slotKey.split(/\s+/).pop();
-      const maxForSlot = (rangeKey && slot_limits[rangeKey] !== undefined) ? slot_limits[rangeKey] : 1;
+      const part = slotKey.split(/\s+/).pop();
+      const hour = parseInt(part, 10);
+      const limitKey = Number.isFinite(hour) && String(hour) === part ? hour : part;
+      const maxForSlot = (limitKey !== undefined && slot_limits[limitKey] !== undefined) ? slot_limits[limitKey] : 1;
       const { count: slotCount, error: slotErr } = await supabase
         .from('orders')
         .select('id', { count: 'exact', head: true })
         .eq('delivery_time_slot', slotKey);
       if (slotErr) throw slotErr;
       if ((slotCount ?? 0) >= maxForSlot) {
-        return res.status(400).json({ error: 'חלון המשלוח שנבחר תפוס. בחרו חלון אחר.' });
+        return res.status(400).json({ error: 'שעת המשלוח שנבחרה תפוסה. בחרו שעה אחרת.' });
       }
     }
     const subtotal = items.reduce((sum, i) => sum + Number(i.quantity) * Number(i.unit_price), 0);
